@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+  PhotoBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 'search-photos-store'
+      AccessControl: PublicReadWrite
+
+  PhotoBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref PhotoBucket
+      PolicyDocument:
+        Id: PhotoStorePolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicGetAndPut
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Resource:
+              - !Sub arn:aws:s3:::${PhotoBucket}/*
+
+  ClientBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 'search-frontend-store'
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+  
+  ClientBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ClientBucket
+      PolicyDocument:
+        Id: PublicWebsitePolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGet
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource:
+              - !Sub arn:aws:s3:::${ClientBucket}
+              - !Sub arn:aws:s3:::${ClientBucket}/*
+
+  BotRuntimeRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lexv2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: LexRuntimeRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'polly:SynthesizeSpeech'
+                  - 'comprehend:DetectSentiment'
+                Resource: '*'
+
+  PhotoSearchBot:
+    DependsOn: BotRuntimeRole
+    Type: 'AWS::Lex::Bot'
+    Properties:
+      Name: 'PhotoSearch'
+      RoleArn: !GetAtt BotRuntimeRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+
+  SearchLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess
+
+  SearchLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'search-photos'
+      Runtime: python3.9
+      Role: !GetAtt SearchLambdaRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+            return {
+              "statusCode": 200,
+              "headers": {
+                  "Access-Control-Allow-Headers": "Content-Type",
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
+              },
+              "body": json.dumps(image_json),
+            }
+      Timeout: 5
+
+  IndexLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonOpenSearchServiceFullAccess
+
+  IndexLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'index-photos'
+      Runtime: python3.9
+      Role: !GetAtt IndexLambdaRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+            return {
+              "statusCode": 200,
+              "headers": {
+                  "Access-Control-Allow-Headers": "Content-Type",
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
+              },
+              "body": json.dumps(image_json),
+            }
+      Timeout: 5
+
+  PhotoAlbumRestAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'photo-album-API'
+      Description: 'API for putting images to S3 and searching images from OpenSearch'
+
+  ProxyResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt PhotoAlbumRestAPI.RootResourceId
+      RestApiId: !Ref PhotoAlbumRestAPI
+      PathPart: '{proxy+}'
+
+  SearchGetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref PhotoAlbumRestAPI
+      AuthorizationType: 'NONE'
+      HttpMethod: 'ANY'
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'GET'
+        RequestParameters:
+          q: 'method.request.querystring.q'
+        IntegrationResponses:
+          StatusCode: 200
+          Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt "search-photos.Arn"
+      ResourceId: !Ref ProxyResource
+
+  UploadPutMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref MyApi
+      AuthorizationType: 'NONE'
+      HttpMethod: 'PUT'
+      Integration:
+        Type: 'AWS'
+        Uri: 'arn:aws:apigateway:${AWS::Region}:S3:path/{bucket}/{key}'
+        IntegrationHttpMethod: 'PUT'
+        RequestParameters:
+          bucket: 'method.request.querystring.bucket'
+          key: 'method.request.querystring.key'
+          x-amz-meta-customLabels: 'method.request.header.x-amz-meta-customLabels'
+
+  PhotosOpensearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: photosearch
+      EngineVersion: 'OpenSearch_1.3'
+      ClusterConfig:
+        InstanceCount: 3
+        InstanceType: t3.medium.search
+        ZoneAwarenessEnabled: true
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: 3
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+        VolumeType: gp3
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'es:*'
+            Resource: '*'
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true 
+      AdvancedSecurityOptions:
+        Enabled: true
+
+  CodeBuildServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: 'client-codebuild-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource:
+                - !Sub arn:aws:s3:::${PhotoBucket}/*
+                - !Sub arn:aws:s3:::${ClientBucket}/*
+                - !Sub arn:aws:s3:::${ClientBucket}
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:ListObjects
+
+  LambdaCodeBuild:
+    Type: 'AWS::CodeBuild:Project'
+    Properties:
+      Name: 'album-lambda-build'
+      Artifacts:
+        Type: 'CODEPIPELINE'
+      Source:
+        Type: 'CODEPIPELINE'
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.9
+            build:
+              commands:
+                - echo Build started on `date`
+            post_build:
+              commands:
+                - echo "Updating lambda function index-photos"
+                - aws lambda update-function-code --function-name index-photos --zip-file fileb://index-photos.zip
+                - echo "Updating lambda function search-photos"
+                - aws lambda update-function-code --function-name search-photos --zip-file fileb://search-photos.zip
+                - echo "Done!"
+      ServiceRole: !Ref CodeBuildServiceRole
+
+  S3CodeBuild:
+    Type: 'AWS::CodeBuild:Project'
+    Properties:
+      Name: 'album-frontend-build'
+      Artifacts:
+        Type: 'CODEPIPELINE'
+      Source:
+        Type: 'CODEPIPELINE'
+        BuildSpec: |
+          version: 0.2
+          phases:
+           build:
+             commands:
+              - echo "Copying to S3"
+              - aws s3 sync "./frontend" "s3://search-frontend-store"
+      ServiceRole: !Ref CodeBuildServiceRole
+
+  PipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: 'code-pipeline-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Resource:
+                - !Sub arn:aws:s3:::${PhotoBucket}/*
+                - !Sub arn:aws:s3:::${ClientBucket}/*
+                - !Sub arn:aws:s3:::${ClientBucket}
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:ListObjects
+              - Resource: 'arn:aws:s3:::*'
+                Effect: Allow
+                Action: s3:ListAllMyBuckets
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+              - Resource: '*'
+                Effect: Allow
+                Action: 'lambda:*'
+
+  LambdaPipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: 'cloud-lambda-pipeline'
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 2
+                Provider: GitHub
+              Configuration:
+                Owner: 'reganbragg'
+                Repo: 'cloud-lambda-pipeline'
+                Branch: 'master'
+                OAuthToken: 'abcdefghijklmnopqrstuvwxyz'
+            - Name: Build
+              Actions:
+               - Name: 'LambdaBuildStep'
+               ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Version: 1
+                  Provider: CodeBuild
+                Configuration:
+                  ProjectName: !Ref LambdaCodeBuild
+
+  S3Pipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      Name: 'cloud-s3-pipeline'
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 2
+                Provider: GitHub
+              Configuration:
+                Owner: 'reganbragg'
+                Repo: 'smart-photo-album'
+                Branch: 'main'
+                OAuthToken: 'abcdefghijklmnopqrstuvwxyz'
+            - Name: Build
+              Actions:
+               - Name: 'LambdaBuildStep'
+               ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Version: 1
+                  Provider: CodeBuild
+                Configuration:
+                  ProjectName: !Ref S3CodeBuild
+
+
+
+
+
+
